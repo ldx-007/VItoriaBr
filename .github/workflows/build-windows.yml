@@ -1,0 +1,41 @@
+name: Build VItoriaBr for Windows
+
+on:
+  workflow_dispatch:
+
+jobs:
+  build:
+    runs-on: windows-latest
+    permissions:
+      contents: read
+    steps:
+      - uses: actions/checkout@v5
+      - run: rustup toolchain install
+      - uses: Swatinem/rust-cache@v2
+
+      # The recommended build: this fork already ships the anti-TDR defaults
+      # in release (loop limit falls back to 4096/256/128, VICTORY_SHADER_LOOP_LIMIT
+      # overrides in any build), so victory.exe alone is the one to run.
+      - run: cargo build --release -p victory --locked
+      - uses: actions/upload-artifact@v4
+        with:
+          name: vitoriabr-windows-x64
+          path: target/release/victory.exe
+          if-no-files-found: error
+
+      # Diagnostics build: WARP software adapter, DRED breadcrumbs, frame capture,
+      # PNG target dumps. A failure below costs only this artifact.
+      - continue-on-error: true
+        run: cargo build --profile diag -p victory --features diagnostics --locked
+
+      # Named apart so both artifacts unpack into one folder without clashing.
+      - continue-on-error: true
+        shell: pwsh
+        run: Copy-Item target/diag/victory.exe target/diag/victory-diag.exe
+
+      - continue-on-error: true
+        uses: actions/upload-artifact@v4
+        with:
+          name: vitoriabr-windows-x64-diag
+          path: target/diag/victory-diag.exe
+          if-no-files-found: error
