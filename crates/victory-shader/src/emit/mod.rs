@@ -97,6 +97,8 @@ mod threading;
 #[cfg(windows)]
 pub mod validator;
 #[cfg(all(test, windows))]
+mod test_skip;
+#[cfg(all(test, windows))]
 mod valu_tests;
 #[cfg(all(test, windows))]
 mod waterfall_tests;
@@ -115,7 +117,7 @@ pub use rect::rect_list_gs;
 pub use shader::{
     MEMORY_FAULTS, MEMORY_PAGES, ROOT_CBV_SPACE, SAMPLER_SPACE, SLOT_FAULTS, SLOT_MEMORY, SLOT_STRIDES,
     SLOT_STRIDES_COUNT, SLOT_VIEW_BYTES, SLOT_VIEWS, SLOT_VIEWS_COUNT, USER_DATA_SPACE,
-    USER_MEMORY_BASE, USER_VIEW_ADDRESS, USER_VIEW_BIAS,
+    USER_DISPATCH_THREADS_X, USER_MEMORY_BASE, USER_VIEW_ADDRESS, USER_VIEW_BIAS,
     set_view_heap_limit, view_heap_limit,
 };
 
@@ -143,7 +145,10 @@ pub fn loop_limit() -> u32 {
 /// thread: the group stands until Windows resets the card. (The console's
 /// barrier is the wave's, whatever lanes are live, and a wave that ended
 /// is not waited for.) `VICTORY_GROUP_SYNC`:
-/// - unset or `2`: every barrier waits, as before.
+/// - unset or `auto`: on hosts narrower than the console wave, the title's
+///   divergent barriers retain their memory fences but do not wait. Other
+///   hosts and uniform barriers keep their group sync.
+/// - `2`: every barrier waits, as before.
 /// - `1`: the title's `s_barrier` waits only in a block every lane runs,
 ///   in a program no lane can be cut out of at the iteration limit.
 /// - `0`: no barrier waits, neither the title's nor the ones the
@@ -155,12 +160,26 @@ pub fn loop_limit() -> u32 {
 /// Part of the translation: the shader cache keys on it (`victory-gpu`'s
 /// does).
 pub fn group_sync() -> u8 {
+    #[cfg(test)]
+    if let Some(mode) = TEST_GROUP_SYNC.get() {
+        return mode;
+    }
     static MODE: std::sync::OnceLock<u8> = std::sync::OnceLock::new();
-    *MODE.get_or_init(|| match std::env::var("VICTORY_GROUP_SYNC").ok().as_deref().map(str::trim) {
+    *MODE.get_or_init(|| parse_group_sync(std::env::var("VICTORY_GROUP_SYNC").ok().as_deref()))
+}
+
+#[cfg(test)]
+thread_local! {
+    static TEST_GROUP_SYNC: std::cell::Cell<Option<u8>> = const { std::cell::Cell::new(None) };
+}
+
+fn parse_group_sync(value: Option<&str>) -> u8 {
+    match value.map(str::trim) {
         Some("0") => 0,
         Some("1") => 1,
-        _ => 2,
-    })
+        Some("2") => 2,
+        _ => 3,
+    }
 }
 
 /// The clean-up passes that run over a translated program before it is
@@ -259,6 +278,10 @@ pub struct HostShader {
     /// Root UAVs (raw buffers) the shader reads or writes: `u<index>` in
     /// [`ROOT_CBV_SPACE`].
     pub root_uavs: Vec<u8>,
+    /// Subset of root UAV slots through which this shader may write.
+    pub written_root_uavs: Vec<u8>,
+    /// A translated store or atomic can write through the guest page directory.
+    pub writes_guest_memory: bool,
     /// Heap descriptors that can be selected from root state at bind time.
     pub root_indexed_views: Vec<crate::resource::RootIndexedView>,
 }
@@ -670,7 +693,7 @@ fn emit_program(
         }
         _ => 0,
     };
-    let l = lower::lower(&lower::Parts {
+    let parts = lower::Parts {
         native,
         p,
         st,
@@ -680,7 +703,16 @@ fn emit_program(
         outputs,
         prims,
         mesh_stride,
-    })?;
+    };
+    // The ray-structure builder's Box32/16 rehydration kernels encode one
+    // header per active thread of the group; their last group can be short.
+    // The caller's dispatch knows the actual thread count.
+    let box_rehydration = matches!(
+        u128::from_be_bytes(c.digest),
+        0xba30_5538_e28d_414c_af39_a51a_4bc2_f308
+            | 0xd635_3bf6_df15_ff8e_c4aa_aec1_0dbf_3974
+    ) && matches!(native.io, crate::native::StageIo::Cs(cs) if cs.threads == [64, 1, 1]);
+    let l = lower::lower_with_thread_limit(&parts, box_rehydration)?;
     let wave_size = l.wave_size;
     let shader = HostShader {
         stage: native.stage,
@@ -702,6 +734,8 @@ fn emit_program(
         root_cbvs: l.root_cbvs,
         root_srvs: l.root_srvs,
         root_uavs: l.root_uavs,
+        written_root_uavs: l.written_root_uavs,
+        writes_guest_memory: l.writes_guest_memory,
         root_indexed_views: res.root_indexed_views.clone(),
     };
     Ok((shader, wave_size))
@@ -805,6 +839,16 @@ mod tests {
     use super::bitcode::Attr;
     use super::lower::LOOP_LIMIT;
     use super::parse_loop_limit;
+
+    #[test]
+    fn group_sync_defaults_to_auto_and_keeps_explicit_overrides() {
+        for value in [None, Some("auto"), Some(""), Some("invalid")] {
+            assert_eq!(super::parse_group_sync(value), 3);
+        }
+        for (value, mode) in [("0", 0), (" 1 ", 1), ("2", 2)] {
+            assert_eq!(super::parse_group_sync(Some(value)), mode);
+        }
+    }
 
     #[test]
     fn the_clean_up_switch_parses_or_runs_every_pass() {
@@ -1067,7 +1111,7 @@ mod tests {
     #[cfg(windows)]
     fn stub_pipeline_is_created() {
         let Ok(host) = super::host::Host::new(false) else {
-            eprintln!("no SM 6.6 device; skipped");
+            crate::emit::test_skip::skip("no SM 6.6 device; skipped");
             return;
         };
         let ps = super::HostShader {
@@ -1079,6 +1123,8 @@ mod tests {
             root_cbvs: Vec::new(),
             root_srvs: Vec::new(),
             root_uavs: Vec::new(),
+            written_root_uavs: Vec::new(),
+            writes_guest_memory: false,
             root_indexed_views: Vec::new(),
         };
         let file = |var: &str, stage| {
@@ -1091,6 +1137,8 @@ mod tests {
                 root_cbvs: Vec::new(),
                 root_srvs: Vec::new(),
                 root_uavs: Vec::new(),
+                written_root_uavs: Vec::new(),
+                writes_guest_memory: false,
                 root_indexed_views: Vec::new(),
             })
         };
@@ -1124,7 +1172,7 @@ mod tests {
         let mut c = constant_color();
         let path = super::validator::Validator::default_path();
         let Ok(mut v) = super::validator::Validator::load(path.as_deref()) else {
-            eprintln!("no dxil.dll; skipped");
+            crate::emit::test_skip::skip("no dxil.dll; skipped");
             return;
         };
         let ours = c[4..20].to_vec();
@@ -1207,6 +1255,74 @@ mod tests {
         assert_eq!(center[4 + 1], 0, "center interpolation is per pixel");
         let sample = psv_of(1 << 0);
         assert_eq!(sample[4 + 1], 1, "PSInfo.SampleFrequency");
+    }
+
+    /// A primitive-ordered pixel shader (POPS): it takes the packer bits of
+    /// the collision wave id the hardware loads after the system SGPRs,
+    /// writes them to `HW_REG_POPS_PACKER` and adds `src_pops_exiting_wave_id`
+    /// (the wait for overlapping waves). Translated as the first wave of its
+    /// ordered section (the id and the exiting id read 0, the packer write is
+    /// dropped; its UAVs become rasterizer-ordered views); it was refused for
+    /// "a hardware SGPR input".
+    #[test]
+    fn primitive_ordered_pixel_shaders_translate_without_ordering() {
+        let words = [
+            0x9381_FF12u32, // s_bfe_u32 s1, s18, 0x0002001c (packer, bits 28-29)
+            0x0002_001C,
+            0xB981_1019, // s_setreg_b32 hwreg(HW_REG_POPS_PACKER, 0, 3), s1
+            0x8102_01EF, // s_add_i32 s2, src_pops_exiting_wave_id, s1
+            0x7E04_0202, // v_mov_b32 v2, s2
+            0xF800_180F,
+            0x0202_0202, // exp mrt0, v2, v2, v2, v2 done vm
+            0xBF81_0000, // s_endpgm
+        ];
+        let native = super::NativeProgram {
+            stage: super::HwStage::Ps,
+            wave64: true,
+            vgprs: 4,
+            layout: vec![],
+            used: vec![],
+            io: crate::native::StageIo::Ps {
+                inputs: vec![],
+                input_addr: 1 << 1,
+                db_shader_control: 0,
+                patches: vec![],
+            },
+            code: words.iter().flat_map(|w| w.to_le_bytes()).collect(),
+        };
+        let osg1 = super::container::signature(
+            &[SigElement {
+                name: "SV_Target".into(),
+                index: 0,
+                kind: 16,
+                comp: 9,
+                interp: 0,
+                row: Some(0),
+                col: 0,
+                cols: 4,
+                usage: 15,
+                half: false,
+            }],
+            false,
+        );
+        let isg1 = super::container::signature(&[], true);
+        let bytes = crate::dxbc::build(&[(super::FourCC::ISG1, &isg1), (super::FourCC::OSG1, &osg1)]);
+        let c = super::Container::parse(&bytes).unwrap();
+        let p = crate::ir::build(&native.patched_code(), native.wave64, native.vgprs).unwrap();
+        assert!(p.inputs.iter().any(|&(r, _)| r == crate::ir::Reg::S(18)), "the collision wave id is an input");
+        let st = crate::structure::structure(&p).unwrap();
+        let res = crate::resource::track(&p, &native.layout, native.stage, Some(&st)).unwrap();
+        let io = crate::io::raise(&p, &native).unwrap();
+        let out =
+            super::emit(&c, &native, &p, &st, &io, &res).expect("a POPS pixel shader translates");
+        let host = super::Container::parse(&out.dxil).expect("the emitted shader container parses");
+        assert!(host.part(super::FourCC::DXIL).is_some());
+        #[cfg(windows)]
+        if let Ok(mut v) =
+            super::validator::Validator::load(super::validator::Validator::default_path().as_deref())
+        {
+            v.validate(&mut out.dxil.clone()).unwrap();
+        }
     }
 
     /// A pixel shader reading channel z of an input whose element starts at
@@ -1382,6 +1498,8 @@ mod tests {
                 root_cbvs: l.root_cbvs,
                 root_srvs: l.root_srvs,
                 root_uavs: l.root_uavs,
+                written_root_uavs: l.written_root_uavs,
+                writes_guest_memory: l.writes_guest_memory,
                 root_indexed_views: Vec::new(),
             };
             let (root, pso) = host.compute_pipeline(&cs).unwrap();
@@ -1611,6 +1729,29 @@ mod barycentric_tests {
             v.validate(&mut shader.dxil.clone()).unwrap();
         }
         let _ = shader;
+    }
+
+    #[test]
+    fn pixel_quad_swizzles_validate_and_dpp8_cannot_cross_quads() {
+        let [e0, e1] = exp_mrt0(3);
+        let swizzle = |instruction: [u32; 2]| {
+            let words = [
+                0xc808_0000, 0xc809_0001, // interpolate attr0.x into v2
+                instruction[0], instruction[1], e0, e1, 0xbf81_0000,
+            ];
+            pixel(&words, PERSP_CENTER)
+        };
+        for permutation in [0x00, 0x55, 0xaa, 0xff, 0xb1, 0x4e, 0x1b, 0xe4, 0x27] {
+            // ds_swizzle_b32 v3,v2 and v_mov_b32 v3,v2 quad_perm.
+            validate(&swizzle([0xd8d4_8000 | permutation, 0x0300_0002]).unwrap());
+            validate(&swizzle([0x7e06_02fa, 0xff00_0002 | permutation << 8]).unwrap());
+        }
+        // DPP8: different permutations in the two quads of an octet.
+        let selections = [3u32, 0, 2, 1, 4, 6, 5, 7];
+        let sel = selections.into_iter().enumerate().fold(0, |s, (i, n)| s | n << (3 * i));
+        let mov_dpp8 = |sel: u32| [0x7e06_02e9, (sel << 8) | 2];
+        validate(&swizzle(mov_dpp8(sel)).unwrap());
+        assert!(swizzle(mov_dpp8(sel ^ 4)).is_err(), "lane 0 now reads lane 7");
     }
 
     /// Custom interpolation reads I and J (v0, v1 with PERSP_CENTER) as
@@ -1979,6 +2120,7 @@ mod lds_bounds_tests {
         w.push(S_ENDPGM);
 
         let cs = compile_lds_cs(&w, false, 24, 1, [64, 1, 1]).unwrap();
+        let _ = &cs;
         #[cfg(windows)]
         {
             let _one = super::valu_tests::ONE_AT_A_TIME
@@ -1987,6 +2129,7 @@ mod lds_bounds_tests {
             let addrs = [0u32, 508, 512, 0xFFFF_FFF0, 1, 509, 602];
             for (label, warp) in [("hardware", false), ("warp", true)] {
                 let Ok(host) = super::host::Host::new(warp) else {
+                    super::test_skip::skip(&format!("no SM 6.6 {label} device"));
                     continue;
                 };
                 let (root, pso) = host.compute_pipeline(&cs).unwrap();
@@ -2075,6 +2218,7 @@ mod lds_bounds_tests {
         w.push(S_ENDPGM);
 
         let cs = compile_lds_cs(&w, false, 10, 1, [64, 1, 1]).unwrap();
+        let _ = &cs;
         #[cfg(windows)]
         {
             let _one = super::valu_tests::ONE_AT_A_TIME
@@ -2085,6 +2229,7 @@ mod lds_bounds_tests {
             addrs[2] = 0; // lane 2 is active and in-bounds
             for (label, warp) in [("hardware", false), ("warp", true)] {
                 let Ok(host) = super::host::Host::new(warp) else {
+                    super::test_skip::skip(&format!("no SM 6.6 {label} device"));
                     continue;
                 };
                 let (root, pso) = host.compute_pipeline(&cs).unwrap();
@@ -2186,6 +2331,7 @@ mod lds_bounds_tests {
         // explicit WaveSize(32) PSOs, so execute on hardware GPU when present
         // (`compile_lds_cs` already validates the container with `dxil.dll`).
         let cs = compile_lds_cs(&w, true, 6, 1, [64, 1, 1]).unwrap();
+        let _ = &cs;
         #[cfg(windows)]
         {
             let _one = super::valu_tests::ONE_AT_A_TIME

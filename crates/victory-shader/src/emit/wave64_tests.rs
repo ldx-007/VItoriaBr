@@ -105,21 +105,34 @@ fn lowered_on(
     wide: &HashSet<usize>,
     host_wave: u32,
 ) -> Result<HostShader, ShaderError> {
+    lowered_dispatch(native, p, wide, host_wave, false)
+}
+
+fn lowered_dispatch(
+    native: &NativeProgram,
+    p: &ir::Program,
+    wide: &HashSet<usize>,
+    host_wave: u32,
+    partial: bool,
+) -> Result<HostShader, ShaderError> {
     let st = structure::structure_wide(p, wide).expect("structure");
     let res = resource::track(p, &native.layout, native.stage, Some(&st)).expect("resource::track");
     let io = io::raise(p, native).expect("io::raise");
     let was = lower::TEST_HOST_WAVE.replace(Some(host_wave));
-    let lowered = lower::lower(&lower::Parts {
-        native,
-        p,
-        st: &st,
-        io: &io,
-        res: &res,
-        inputs: Vec::new(),
-        outputs: Vec::new(),
-        prims: Vec::new(),
-        mesh_stride: 0,
-    });
+    let lowered = lower::lower_with_thread_limit(
+        &lower::Parts {
+            native,
+            p,
+            st: &st,
+            io: &io,
+            res: &res,
+            inputs: Vec::new(),
+            outputs: Vec::new(),
+            prims: Vec::new(),
+            mesh_stride: 0,
+        },
+        partial,
+    );
     lower::TEST_HOST_WAVE.set(was);
     let lowered = lowered?;
     Ok(HostShader {
@@ -131,8 +144,100 @@ fn lowered_on(
         root_cbvs: lowered.root_cbvs,
         root_srvs: lowered.root_srvs,
         root_uavs: lowered.root_uavs,
+        written_root_uavs: lowered.written_root_uavs,
+        writes_guest_memory: lowered.writes_guest_memory,
         root_indexed_views: res.root_indexed_views,
     })
+}
+
+#[test]
+fn a_first_lane_read_of_a_uniform_scan_carries_across_the_halves() {
+    // A per-console-wave scan: the low half and the high half share the
+    // scalar running sum and read the same LDS dword, so the first-lane
+    // value is the same in both and needs no group barrier (which a group
+    // of four console waves could not reach together anyway).
+    let words = [
+        0x2C0E_0086, // v_lshrrev_b32 v7, 6, v0
+        0x7E10_0280, // v_mov_b32 v8, 0
+        0xBE80_047E, // s_mov_b64 s[0:1], exec
+        0x7DAA_0E80, // v_cmpx_ne_u32 exec, 0, v7
+        0xBF88_000E, // s_cbranch_execz label_0013 (word 19)
+        0xBE92_0380, // s_mov_b32 s18, 0
+        0xBE91_0380, // s_mov_b32 s17, 0
+        0xBE86_047E, // s_mov_b64 s[6:7], exec
+        0xBF82_0000, // s_branch label_0009 (word 9)
+        0x7E22_0508, // v_readfirstlane_b32 s17, v8
+        0x8F10_8212, // s_lshl_b32 s16, s18, 2
+        0x8112_8112, // s_add_i32 s18, s18, 1
+        0x7E10_0210, // v_mov_b32 v8, s16
+        0xD8D8_0000, 0x0800_0008, // ds_read_b32 v8, v8
+        0x4A10_1011, // v_add_nc_u32 v8, s17, v8
+        0x7DA4_0E12, // v_cmpx_eq_u32 exec, s18, v7
+        0x8A86_7E06, // s_andn2_b64 s[6:7], s[6:7], exec
+        0xBF85_FFF6, // s_cbranch_scc1 label_0009
+        0xBF81_0000, // s_endpgm
+    ];
+    let native = native_of(&words, true, 256);
+    let p = ir::build(&native.code, native.wave64, native.vgprs).unwrap();
+    let shader = lowered_dispatch(&native, &p, &HashSet::new(), 32, false).unwrap();
+    let mut validator =
+        validator::Validator::load(validator::Validator::default_path().as_deref()).unwrap();
+    validator.validate(&mut shader.dxil.clone()).unwrap();
+}
+
+#[test]
+fn partial_thread_dispatch_masks_the_final_groups_memory_writes() {
+    // Each active thread increments counter[local X]. With two groups the
+    // tail's first N lanes report two increments, the others only one.
+    let native = native(&[
+        0x3402_0082, // v_lshlrev_b32 v1, 2, v0
+        0x7e04_0281, // v_mov_b32 v2, 1
+        0xe0c8_1000, 0x8002_0201, // buffer_atomic_add v2, v1, s[8:11], 0 offen
+    ]);
+    let p = ir::build(&native.code, native.wave64, native.vgprs).unwrap();
+    let shader = lowered_dispatch(&native, &p, &HashSet::new(), 64, true).unwrap();
+    let limit = shader
+        .user_data
+        .iter()
+        .find(|u| u.root == RootType::Other(super::USER_DISPATCH_THREADS_X))
+        .unwrap();
+    assert_eq!((limit.slot, limit.dword), (0, 64));
+    let mut validator =
+        validator::Validator::load(validator::Validator::default_path().as_deref()).unwrap();
+    validator.validate(&mut shader.dxil.clone()).unwrap();
+    let _one = super::valu_tests::ONE_AT_A_TIME
+        .lock()
+        .unwrap_or_else(|e| e.into_inner());
+    let Ok(host) = Host::new(true) else {
+        crate::emit::test_skip::skip("no SM 6.6 WARP adapter");
+        return;
+    };
+    let (root, pso) = host.compute_pipeline(&shader).unwrap();
+    for count in [0u32, 1, 7, 63, 64, 65, 74, 77, 127, 128] {
+        let mut constants = vec![0; shader.user_data_dwords() as usize];
+        constants[limit.index as usize] = count;
+        let result = host
+            .dispatch(
+                &root,
+                &pso,
+                &Dispatch {
+                    roots: vec![(0, Root::Constants(constants))],
+                    views: &[View::RawUav(68)],
+                    samplers: &[],
+                    groups: [2, 1, 1],
+                },
+            )
+            .unwrap();
+        let active = if count == 0 { 128 } else { count };
+        for (i, &word) in result[0].iter().enumerate() {
+            let expected = if i < 64 {
+                u32::from((i as u32) < active) + u32::from((i as u32 + 64) < active)
+            } else {
+                0
+            };
+            assert_eq!(word, expected, "count {count}, word {i}");
+        }
+    }
 }
 
 #[test]
@@ -181,13 +286,13 @@ fn a_sum_of_halves_over_the_wave_is_the_consoles_tree_bit_for_bit() {
     assert_ne!(tree[0], in_a_row, "these terms tell the tree from another order");
     let _one = super::valu_tests::ONE_AT_A_TIME.lock().unwrap_or_else(|e| e.into_inner());
     let Ok(host) = Host::new(false) else {
-        eprintln!("no SM 6.6 hardware device; not run");
+        crate::emit::test_skip::skip("no SM 6.6 hardware device; not run");
         return;
     };
     let (root, pso) = match host.compute_pipeline(&shader) {
         Ok(x) => x,
         Err(e) => {
-            eprintln!("the hardware device does not take this program (waves of 32?): {e}; not run");
+            crate::emit::test_skip::skip(&format!("the hardware device does not take this program (waves of 32?): {e}; not run"));
             return;
         }
     };
@@ -215,6 +320,17 @@ fn a_sum_of_halves_over_the_wave_is_the_consoles_tree_bit_for_bit() {
 /// lanes that are here read each partner run's sum from a lane of it that is here.
 #[test]
 fn a_sum_of_halves_where_lanes_have_left_is_the_consoles_tree_bit_for_bit() {
+    check_half_sum_with_lanes_gone(64);
+}
+
+/// The same console FP16 reduction on narrow-wave hardware, with early-outs
+/// removed so both host waves can participate in the exchange.
+#[test]
+fn a_sum_of_halves_with_early_outs_runs_on_wave32_hardware() {
+    check_half_sum_with_lanes_gone(32);
+}
+
+fn check_half_sum_with_lanes_gone(host_wave: u32) {
     let mut words = vec![
         0x7DA8_0000, // v_cmpx_gt_u32 exec, s0, v0: the lanes below s0 stay
         0, // s_cbranch_execz to the end (filled in below)
@@ -235,7 +351,12 @@ fn a_sum_of_halves_where_lanes_have_left_is_the_consoles_tree_bit_for_bit() {
     words[1] = 0xBF88_0000 | (words.len() as u32 - 2);
     let native = native(&words);
     let p = ir::build(&native.code, native.wave64, native.vgprs).expect("ir::build");
-    let shader = lowered_on(&native, &p, &HashSet::new(), 64).expect("lower");
+    let p = if host_wave == 32 {
+        ir::without_early_outs(&p).expect("remove early-outs")
+    } else {
+        p
+    };
+    let shader = lowered_on(&native, &p, &HashSet::new(), host_wave).expect("lower");
     if let Ok(mut v) = validator::Validator::load(validator::Validator::default_path().as_deref()) {
         let mut copy = shader.dxil.clone();
         v.validate(&mut copy).expect("DXIL validation failed");
@@ -258,6 +379,32 @@ fn a_sum_of_halves_where_lanes_have_left_is_the_consoles_tree_bit_for_bit() {
     };
     let add = |a: u16, b: u16| narrow(wide(a) + wide(b));
     let _one = super::valu_tests::ONE_AT_A_TIME.lock().unwrap_or_else(|e| e.into_inner());
+    let Ok(host) = Host::new(false) else {
+        crate::emit::test_skip::skip("no SM 6.6 hardware device; not run");
+        return;
+    };
+
+    let mut waves = windows::Win32::Graphics::Direct3D12::D3D12_FEATURE_DATA_D3D12_OPTIONS1::default();
+
+    // SAFETY: a plain feature query on the live device.
+    unsafe {
+        host.device.CheckFeatureSupport(
+            windows::Win32::Graphics::Direct3D12::D3D12_FEATURE_D3D12_OPTIONS1,
+            (&raw mut waves).cast(),
+            size_of_val(&waves) as u32,
+        ).expect("host wave capabilities");
+    }
+
+    if !waves.WaveOps.as_bool()
+        || host_wave < waves.WaveLaneCountMin
+        || host_wave > waves.WaveLaneCountMax
+    {
+        crate::emit::test_skip::skip(&format!(
+            "host does not support WaveSize({host_wave}); not run"
+        ));
+        return;
+    }
+
     let mut ran = false;
     for stay in [64u32, 63, 40, 33, 32, 17, 5, 1] {
         let terms: Vec<u16> = (0..64u32)
@@ -308,11 +455,11 @@ fn a_16_bit_sum_rounds_to_nearest_when_asked_to() {
             v.validate(&mut copy).expect("DXIL validation failed");
         }
         let Ok(host) = Host::new(false) else {
-            eprintln!("no SM 6.6 hardware device; not run");
+            crate::emit::test_skip::skip("no SM 6.6 hardware device; not run");
             return;
         };
         let Ok((root, pso)) = host.compute_pipeline(&shader) else {
-            eprintln!("the hardware device does not take this program; not run");
+            crate::emit::test_skip::skip("the hardware device does not take this program; not run");
             return;
         };
         let ud = vec![0u32; shader.user_data_dwords().max(1) as usize];
@@ -382,13 +529,13 @@ fn a_wave_or_inside(skip: u32, name: &str) {
     // both halves, whichever half's lanes take the branch.
     let _one = super::valu_tests::ONE_AT_A_TIME.lock().unwrap_or_else(|e| e.into_inner());
     let Ok(host) = Host::new(false) else {
-        eprintln!("no SM 6.6 hardware device; not run");
+        crate::emit::test_skip::skip("no SM 6.6 hardware device; not run");
         return;
     };
     let (root, pso) = match host.compute_pipeline(&shader) {
         Ok(x) => x,
         Err(e) => {
-            eprintln!("the hardware device does not take this program (waves of 32?): {e}; not run");
+            crate::emit::test_skip::skip(&format!("the hardware device does not take this program (waves of 32?): {e}; not run"));
             return;
         }
     };
@@ -421,12 +568,17 @@ fn a_wave_or_inside(skip: u32, name: &str) {
 /// of the UAV; None (and a line) without a device that takes it.
 fn on_the_card(shader: &HostShader, constants: [u32; 2]) -> Option<u32> {
     let Ok(host) = Host::new(false) else {
-        eprintln!("no SM 6.6 hardware device; not run");
+        crate::emit::test_skip::skip("no SM 6.6 hardware device; not run");
         return None;
     };
-    let Ok((root, pso)) = host.compute_pipeline(shader) else {
-        eprintln!("the hardware device does not take this program; not run");
-        return None;
+    let (root, pso) = match host.compute_pipeline(shader) {
+        Ok(x) => x,
+        Err(e) => {
+            crate::emit::test_skip::skip(&format!(
+                "the hardware device does not take this program: {e}; not run"
+            ));
+            return None;
+        }
     };
     let mut ud = vec![0u32; shader.user_data_dwords().max(1) as usize];
     for u in &shader.user_data {
@@ -531,7 +683,6 @@ fn scc_of_a_mask_operation_joined_with_a_scalar_test_needs_the_skip_wave_wide() 
     eprintln!("ran on the hardware device: the inner test's SCC for every lane once some lane is inside");
 }
 
-
 /// The ray-tracing builder's scans refuse on `v_readfirstlane_b32` under a
 /// per-lane branch: the cross-lane retry ([`super::widen`]) has to take the
 /// branch around it wave-wide so the two host waves meet at the exchange
@@ -554,4 +705,62 @@ fn a_first_lane_refusal_is_retried_wave_wide() {
         crate::native::HwStage::Cs,
         "a descriptor chosen by control flow"
     ));
+}
+
+/// A barrier entered by only part of a console wave must complete on a
+/// wave32 GPU without disabling uniform barriers or translation-added sync.
+#[test]
+fn an_automatic_barrier_inside_a_lane_branch_runs_on_narrow_hardware() {
+    let words = [
+        0x7D88_0000, // v_cmp_gt_u32 vcc, s0, v0
+        0xBE8C_246A, // s_and_saveexec_b64 s[12:13], vcc
+        0xBF88_0001, // s_cbranch_execz over the barrier
+        0xBF8A_0000, // s_barrier
+        0xBEFE_040C, // s_mov_b64 exec, s[12:13]
+        0x7E00_0293, // v_mov_b32 v0, 19
+        0x38 << 26 | 0x1C << 18,
+        0x80 << 24 | 2 << 16, // buffer_store_dword v0, off, s[8:11], 0
+    ];
+    let native = native(&words);
+    let p = ir::build(&native.code, true, native.vgprs).expect("ir::build");
+    let old_mode = super::TEST_GROUP_SYNC.replace(Some(3));
+    let shader = lowered(&native, &p, &HashSet::new());
+    super::TEST_GROUP_SYNC.set(old_mode);
+    let shader = shader.expect("lower divergent barrier");
+    if let Ok(mut validator) = validator::Validator::load(validator::Validator::default_path().as_deref()) {
+        let mut dxil = shader.dxil.clone();
+        validator.validate(&mut dxil).expect("DXIL validation");
+    }
+    let _one = super::valu_tests::ONE_AT_A_TIME.lock().unwrap_or_else(|e| e.into_inner());
+    let Ok(host) = Host::new(false) else {
+        crate::emit::test_skip::skip("no SM 6.6 hardware device; not run");
+        return;
+    };
+    let mut waves = windows::Win32::Graphics::Direct3D12::D3D12_FEATURE_DATA_D3D12_OPTIONS1::default();
+    // SAFETY: a plain feature query on the live device.
+    unsafe {
+        host.device.CheckFeatureSupport(
+            windows::Win32::Graphics::Direct3D12::D3D12_FEATURE_D3D12_OPTIONS1,
+            (&raw mut waves).cast(), size_of_val(&waves) as u32,
+        ).expect("host wave capabilities");
+    }
+    if waves.WaveLaneCountMax >= 64 || waves.WaveLaneCountMax == 0 {
+        crate::emit::test_skip::skip("no narrow-wave hardware device; not run");
+        return;
+    }
+    let (root, pso) = host.compute_pipeline(&shader).expect("pipeline on narrow-wave hardware");
+    for below in [1, 10, 32, 33, 64] {
+        let mut ud = vec![0; shader.user_data_dwords().max(1) as usize];
+        for u in &shader.user_data {
+            if let (RootType::Constants, 0, 0) = (u.root, u.slot, u.dword) {
+                ud[u.index as usize] = below;
+            }
+        }
+        let out = host.dispatch(&root, &pso, &Dispatch {
+            roots: vec![(0, Root::Constants(ud))], views: &[View::RawUav(1)],
+            samplers: &[], groups: [1, 1, 1],
+        }).expect("divergent barrier dispatch completes");
+        assert_eq!(out[0][0], 19, "{below} lanes enter the barrier");
+    }
+    eprintln!("ran automatic divergent barriers on hardware (max wave {}): 1, 10, 32, 33 and 64 active lanes", waves.WaveLaneCountMax);
 }

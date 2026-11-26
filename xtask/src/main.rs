@@ -1,5 +1,6 @@
 //! Repository maintenance. Run with `cargo xtask <command>`.
 
+mod ci;
 mod policy;
 
 use std::path::{Path, PathBuf};
@@ -26,12 +27,20 @@ enum Cmd {
     },
     /// Point git at .githooks/ so every commit runs the policy check.
     InstallHooks,
+    /// Run what the CI workflow runs: on Windows the `check` job, elsewhere
+    /// the `portable` job and a type-check of the Windows build.
+    Ci {
+        /// Off Windows, leave out the Windows type-check.
+        #[arg(long)]
+        no_windows_check: bool,
+    },
 }
 
 fn main() -> Result<()> {
     let root = workspace_root();
     match Cli::parse().command {
         Cmd::Policy { staged } => policy::run(&root, staged),
+        Cmd::Ci { no_windows_check } => ci::run(&root, !no_windows_check),
         Cmd::InstallHooks => {
             let status = Command::new("git")
                 .args(["config", "core.hooksPath", ".githooks"])

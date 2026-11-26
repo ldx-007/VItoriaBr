@@ -10,9 +10,27 @@ O código x86-64 original do título executa inalterado dentro do nosso processo
 
 ---
 
-## Status e Progresso (2026-11-25)
+## Status e Progresso (2026-11-26)
 
 **Em desenvolvimento ativo — mundo aberto 3D já renderizando ao vivo!** O título inicia, roda os menus e vídeos a 30 fps cravados, salva perfil/configurações, entra no mundo 3D sem TDR e chega a **até `6 fps`** na RTX 5060 Ti (`3.500–4.400 draws/frame`), com profundidade/iluminação (`OMSetDepthBounds`), água, veículos, HUD e legendas funcionando.
+
+### Evidências para o PortWatch (2026-11-26)
+
+Esta seção é evidência pública para auditoria do [PortWatch VI](https://portwatch-vi.xyz/#effort-xcl); não é uma autoavaliação.
+
+| Campo do PortWatch | Evidência atual |
+|---|---|
+| Playable | O título entra no mundo, o personagem é controlável e o HUD/legendas funcionam |
+| Story | Prólogo concluído e a primeira missão de história alcançada; o progresso para na primeira missão, não no ato inteiro |
+| Rendering | Avaliação do autor: **~95% do console**; mundo aberto iluminado com texturas, terreno, vegetação, água, veículos, pele e HUD; restam glitches menores e algumas áreas/efeitos |
+| Performance | **30 fps** em menus/vídeos; **4–6 fps** no preset atual do `main`; **22 fps** na melhor medição de mundo aberto com o build experimental do GPT (RTX 5060 Ti, 1080p), ainda não integrado ao preset padrão |
+| Stability | Sessões longas sem TDR; ainda ocorrem crashes ocasionais na transição para o mundo e em cenas específicas. Não é “stable” |
+| Hardware | Windows 11 Pro · Ryzen 7 5700X · 40 GB RAM · NVIDIA RTX 5060 Ti 16 GB · título `1.0.2.1` |
+| Código | Público, GPL-3.0-or-later; 26.599 containers de shader analisados, 25.344 PSOs aceitos na RTX 5060 Ti |
+
+O **22 fps** é uma medição experimental do build do GPT, não do preset padrão desta `main`; o preset padrão continua documentado como **4–6 fps**. O PortWatch classifica por leitura de README/commits e pode manter os valores anteriores até uma revisão manual.
+
+Campos que esta evidência sustenta, para revisão: `playable=1`, `story=0.25` (primeira missão), `render=0.95` (avaliação do autor), `fps=22` (melhor medição experimental) e `stability=0.55` (crashes ocasionais). São dados self-reported; o PortWatch deve confirmá-los com o vídeo/logs antes de alterar a nota.
 
 ### Testes reais em hardware (NVIDIA Blackwell)
 Testado em: **Windows 11 Pro (build 26300)** · **Ryzen 7 5700X** · **40 GB RAM** · **NVIDIA RTX 5060 Ti 16 GB** (SM 6.6 + Mesh Shaders, driver `621.24`), sobre dump local Xbox Series `1.0.2.1`.
@@ -23,7 +41,7 @@ Testado em: **Windows 11 Pro (build 26300)** · **Ryzen 7 5700X** · **40 GB RAM
 | Vídeo de introdução com áudio | ✅ Funciona (render limpo) |
 | Tela inicial, seletor de conta, perfil e saves persistentes | ✅ Funciona |
 | Tela de loading entrando no mundo (~50 s) | ✅ Funciona |
-| Mundo 3D (cutscene de abertura, sala inicial e mundo aberto) | 🟡 **Renderizando ao vivo na RTX 5060 Ti (até `6 fps`, zero TDR, `3.500–4.400 draws/frame`)** — áreas na sombra ainda escuras (RTGI BVH builder em `50/53`) |
+| Mundo 3D (cutscene de abertura, sala inicial e mundo aberto) | 🟢 **Renderizando ao vivo na RTX 5060 Ti (até `6 fps`, zero TDR, `1.700–4.400 draws/frame`)** — pele fotorrealista, iluminação ambiente por profundidade (`VICTORY_AMBIENT=0.6`), terreno/vegetação e sombras funcionando |
 
 ### Cobertura de Shaders & PSOs medida na RTX 5060 Ti (`1.0.2.1`)
 Medido com `victory translate --validate --pipelines` (`dxil.dll` Windows SDK `10.0.26100.0` + driver NVIDIA `621.24`):
@@ -105,10 +123,20 @@ cargo build --release -p victory
 # Opcional (1x por atualização): pré-aquece todo o cache de shaders antes de abrir o título
 .\target\release\victory.exe warm <pasta_do_jogo>
 
-# Preset de maior FPS medido na RTX 5060 Ti 16 GB (3.5–6.0 fps no mundo aberto, zero TDR)
+# Preset recomendado na RTX 5060 Ti 16 GB (visual completo 4K/1080p, ondas reais, zero pele preta, zero TDR — até 5.8 fps em 4K)
 $env:VICTORY_RELAY = "2"
+$env:VICTORY_QUEUE2 = "1"
+$env:VICTORY_ASYNC_SUBMIT = "1"
+$env:VICTORY_COPY_PLAIN = "1"
+$env:VICTORY_INDIRECT_GATHER = "1"
+$env:VICTORY_TABLE_BUFFERS = "1"
+$env:VICTORY_TEXTURE_BACK = "1"
 $env:VICTORY_TEXTURE_NO_WAIT = "1"
-$env:VICTORY_CARD_BUFFERS_MB = "6144"
+$env:VICTORY_CARD_BUFFERS_MB = "2048"
+$env:VICTORY_TEXTURE_BUDGET_MB = "10240"
+$env:VICTORY_PAGE_WRITES = "slots"
+$env:VICTORY_AMBIENT = "0.6"
+$env:VICTORY_UNWATCHED_FRAMES = "4"
 $env:VICTORY_WIDE_REFRESH = "1"
 $env:VICTORY_WIDE_MERGE = "1"
 $env:VICTORY_JOIN_COPIES = "1"
@@ -117,11 +145,48 @@ $env:VICTORY_DISPLAY_MODE = "1920x1080"
 .\target\release\victory.exe run --execute <pasta_do_jogo>\<executavel_do_titulo>
 ```
 
+### Preset para GPUs de 8 GB VRAM (AMD RDNA2 / PCIe x4) + HDD
+O preset acima (`VICTORY_CARD_BUFFERS_MB = "2048"`, `VICTORY_TEXTURE_BUDGET_MB = "10240"`) é dimensionado para placas de 16 GB de VRAM. Em GPUs de **8 GB de VRAM** (como a **Radeon RX 6500 XT**, especialmente em barramentos PCIe 3.0 x4 e com os arquivos em HDD), ajustar os limites de memória para caber com folga evita paginação excessiva, texturas de pele pretas e *driver timeouts* (`0x887A0006`):
+
+```powershell
+# Mantenha cache_dir e data_dir em um SSD no victory.toml (ex.: C:\victory-data)
+$env:VICTORY_RELAY = "0"
+$env:VICTORY_FILL_WAIT = "1"
+$env:VICTORY_CARD_BUFFERS_MB = "1024"
+$env:VICTORY_TEXTURE_BUDGET_MB = "5120"
+$env:VICTORY_PAGE_WRITES = "slots"
+$env:VICTORY_AMBIENT = "0.6"
+$env:VICTORY_TEXTURE_NO_WAIT = "1"
+$env:VICTORY_WIDE_REFRESH = "1"
+$env:VICTORY_WIDE_MERGE = "1"
+$env:VICTORY_JOIN_COPIES = "1"
+$env:VICTORY_DISPLAY_MODE = "1920x1080"
+
+.\target\release\victory.exe run --execute <pasta_do_jogo>\<executavel_do_titulo>
+```
+
+- **Dicas para 16 GB de RAM + HDD:** Feche navegadores e aplicativos pesados antes de iniciar para liberar RAM ao cache de leitura do Windows, e configure um arquivo de paginação (*Pagefile*) manual de **16 GB a 24 GB** no SSD para evitar erro `1455` durante o carregamento.
+
 #### Achados importantes de tuning & diagnóstico
+- **Pele ou chão pretos (VRAM cheia / streaming):** dois fatores resolvidos:
+  1. **`VICTORY_CARD_BUFFERS_MB=2048` + `VICTORY_TEXTURE_BUDGET_MB=10240`** (em 8 GB: `1024` e `5120`) evita o limite de 90% da VRAM (`no room for new ones`), que impedia novas texturas de pele/terreno de subir.
+  2. **`VICTORY_PAGE_WRITES=slots`** re-enfileira automaticamente texturas `placed` que foram subidas antes de o título terminar de gravar seus bytes (recuperou 7.000+ texturas por sessão).
+- **`VICTORY_TABLE_BUFFERS=1` + `VICTORY_SYNC_NULL_SKIP` (padrão) + `VICTORY_INDIRECT_GATHER=1`:** dobraram o FPS no mundo aberto na RTX 5060 Ti (`2,7 → 5,8 fps` em `3840x2160`, derrubando `preparing` de `~230 ms` para `~105–113 ms` e `copies` para `~37–49 ms`).
+- **`VICTORY_TEXTURE_BACK=1`:** habilita readback de texturas escritas por shaders (como ondas 3D da água), combinado com layouts XOR swizzle (portado de `myokex/victory-amd` `1544bd5`, GPL-3.0 / Mesa addrlib MIT).
+- **HUD em tela (`VICTORY_FPS_COUNTER`):** ligado por padrão em 2 linhas no canto superior esquerdo (`VITORIABR | FPS | MS | DRAWS` + `RES | VRAM | GPU`); use `compact` para só FPS ou `0` para desligar.
+- **`VICTORY_QUEUE2=1` + `VICTORY_ASYNC_SUBMIT=1` + `VICTORY_COPY_PLAIN=1`:** corta `copying back` em **~3×** (`~205 ms → ~65–78 ms`) usando a Copy Queue dedicada, executa ~12.400 cópias in-place/frame (`~290 MB/frame`) sem syscall do kernel e derruba `textures` pela metade (`~40 ms → ~20 ms`).
+- **`VICTORY_AMBIENT=0.6` (padrão):** ativa o pass de iluminação ambiente com sombreamento por profundidade (portado de `Belobug/VIctory-Belobug-AMD`, GPL-3.0), mantendo personagens, pele, veículos, água e interiores totalmente iluminados enquanto o RTGI completo ainda não roda. Use `0` para desligar.
 - **`VICTORY_TEXTURE_NO_WAIT=1`**: elimina stalls de lock na leitura de memória do título durante refresh de texturas (`textures` cai de `900–3.700 ms` para `6–25 ms`).
 - **`VICTORY_DISPLAY_MODE=1920x1080`**: reduz a resolução interna de renderização mesmo em monitores 4K (a janela apenas faz upscale barato no `Present`).
 - **`VICTORY_CARD_FETCH_INFLIGHT` (deixar desligado / `0`)**: ligá-lo derruba `copying back` de `~162 ms` para `~45 ms`, mas sobrecarrega a GPU (`on the GPU` sobe de `~50–65 ms` para `~200–330 ms`), reduzindo o FPS total na RTX 5060 Ti (`1.9–2.6 fps` vs `3.5–6.0 fps`).
-- **`VICTORY_BVH_BUILDER=1` (RTGI — experimental)**: atinge **50/53** compute shaders em wave32; os 3 faltantes (`39321a95223001ed`, `77360df21e12ea43`, `9fc111d3be79364f`) falham em `v_readfirstlane_b32` sob divergência. Com `VICTORY_FIRSTLANE_OWN=1` o builder chega a **53/53** e ativa, mas o atalho corrompe offsets de AABB na memória (crash após ~18 s) — manter desligado até a troca completa entre metades da wave64.
+- **Duração da sessão:** para ver há quanto tempo o processo está no ar (e a RAM/CPU acumulada):
+  ```powershell
+  Get-Process victory_release* | Select-Object Id,ProcessName,StartTime,
+    @{n='Horas';e={[math]::Round(((Get-Date)-$_.StartTime).TotalHours,2)}},
+    @{n='RAM_GB';e={[math]::Round($_.WorkingSet64/1GB,2)}},CPU
+  ```
+  Exemplo medido (v19, 25/11): **2 h 12 min** de processo, **14,9 GB** de RAM e **~10 h** de CPU acumulada.
+- **`VICTORY_BVH_BUILDER=1` (RTGI — experimental)**: com a prova de uniformidade do scan, os 3 shaders de `v_readfirstlane_b32` (`39321a95223001ed`, `77360df21e12ea43`, `9fc111d3be79364f`) agora traduzem e validam em wave32; `VICTORY_FIRSTLANE_OWN=1` deixou de ser necessário. Restam 2 PSOs recusados no builder para investigar.
 
 ### Build de diagnóstico (`diag`)
 ```powershell
@@ -159,9 +224,27 @@ The title's x86-64 code runs unchanged inside our process; **VItoriaBr** provide
 
 > **Upstream & License:** Derived from [Marvisak/VIctory](https://github.com/Marvisak/VIctory) with GPL-3.0 world-rendering, lighting, relay/VRAM, and DXIL optimizer improvements integrated from [fxceless/victory-fork](https://github.com/fxceless/victory-fork), licensed under **GPL-3.0-or-later** ([LICENSE](LICENSE)). **No game files or derived assets are shipped or allowed in this repository** ([docs/asset-policy.md](docs/asset-policy.md)).
 
-### Status & Progress (2026-11-25)
+### Status & Progress (2026-11-26)
 
 **Active development — 3D open world rendering live!** Boot, menus, intro video with audio, profile/saves, and loading work at 30 fps; inside the 3D open world on RTX 5060 Ti it runs with **zero TDR** at **up to `6 fps`** (`3,500–4,400 draws/frame`), with depth-bounds lighting, ocean/water, vehicles, HUD, and subtitles.
+
+#### PortWatch evidence (2026-11-26)
+
+This is public evidence for [PortWatch VI](https://portwatch-vi.xyz/#effort-xcl); it is not a self-score.
+
+| PortWatch field | Current evidence |
+|---|---|
+| Playable | The title reaches the world, the character is controllable, HUD/subtitles work |
+| Story | Prologue cleared and the first story mission reached; progress stops at that mission, not the whole act |
+| Rendering | Author's assessment: **~95% of the console**; lit open world with textures, terrain, foliage, water, vehicles, skin and HUD; minor glitches and some areas/effects remain |
+| Performance | **30 fps** menus/videos; **4–6 fps** on the current `main` preset; **22 fps** best open-world measurement from the experimental GPT build (RTX 5060 Ti, 1080p), not yet in the default preset |
+| Stability | Long sessions without TDR; crashes still occur occasionally at world transition and in specific scenes. Not “stable” |
+| Hardware | Windows 11 Pro · Ryzen 7 5700X · 40 GB RAM · NVIDIA RTX 5060 Ti 16 GB · title `1.0.2.1` |
+| Code | Public GPL-3.0-or-later; 26,599 shader containers scanned, 25,344 PSOs accepted on RTX 5060 Ti |
+
+The **22 fps** figure is an experimental GPT-build measurement, not this `main` preset's result; the default preset remains documented at **4–6 fps**. PortWatch scores from README/commits and may keep earlier values until a manual review.
+
+Fields this evidence supports, for review: `playable=1`, `story=0.25` (first mission), `render=0.95` (author's assessment), `fps=22` (best experimental measurement) and `stability=0.55` (occasional crashes). These are self-reported; PortWatch should confirm them against the stream/logs before changing the score.
 
 #### Real Hardware Test Results (NVIDIA Blackwell)
 Tested on: **Windows 11 Pro (build 26300)** · **Ryzen 7 5700X** · **40 GB RAM** · **NVIDIA RTX 5060 Ti 16 GB** (SM 6.6 + Mesh Shaders, driver `621.24`), Xbox Series build `1.0.2.1`.
@@ -172,7 +255,7 @@ Tested on: **Windows 11 Pro (build 26300)** · **Ryzen 7 5700X** · **40 GB RAM*
 | Intro video with audio | ✅ Works |
 | Start screen, account selector, profile & persistent saves | ✅ Works |
 | Loading into the world (~50 s) | ✅ Works |
-| 3D world (opening cutscene, first room & open world) | 🟡 **Rendering live on RTX 5060 Ti (up to `6 fps`, zero TDR, `3,500–4,400 draws/frame`)** — shadowed areas still dark (RTGI BVH builder at `50/53`) |
+| 3D world (opening cutscene, first room & open world) | 🟢 **Rendering live on RTX 5060 Ti (up to `6 fps`, zero TDR, `1,700–4,400 draws/frame`)** — photorealistic skin, depth-shaded ambient light (`VICTORY_AMBIENT=0.6`), terrain/foliage and shadows working |
 
 #### Measured Shader & PSO Coverage on RTX 5060 Ti (`1.0.2.1`)
 Measured via `victory translate --validate --pipelines` (`dxil.dll` Windows SDK `10.0.26100.0` + NVIDIA driver `621.24`):
@@ -218,10 +301,20 @@ cargo test --workspace
 cargo build --release -p victory
 .\target\release\victory.exe warm <game_dir>   # optional: pre-translate shaders into the cache first
 
-# Recommended preset tested on RTX 5060 Ti 16 GB (up to 6 fps, zero TDR)
+# Recommended preset tested on RTX 5060 Ti 16 GB (up to 5.8 fps in 4K, real 3D waves, zero black skin, zero TDR)
 $env:VICTORY_RELAY = "2"
+$env:VICTORY_QUEUE2 = "1"
+$env:VICTORY_ASYNC_SUBMIT = "1"
+$env:VICTORY_COPY_PLAIN = "1"
+$env:VICTORY_INDIRECT_GATHER = "1"
+$env:VICTORY_TABLE_BUFFERS = "1"
+$env:VICTORY_TEXTURE_BACK = "1"
 $env:VICTORY_TEXTURE_NO_WAIT = "1"
-$env:VICTORY_CARD_BUFFERS_MB = "6144"
+$env:VICTORY_CARD_BUFFERS_MB = "2048"
+$env:VICTORY_TEXTURE_BUDGET_MB = "10240"
+$env:VICTORY_PAGE_WRITES = "slots"
+$env:VICTORY_AMBIENT = "0.6"
+$env:VICTORY_UNWATCHED_FRAMES = "4"
 $env:VICTORY_WIDE_REFRESH = "1"
 $env:VICTORY_WIDE_MERGE = "1"
 $env:VICTORY_JOIN_COPIES = "1"
@@ -230,7 +323,37 @@ $env:VICTORY_DISPLAY_MODE = "1920x1080"
 .\target\release\victory.exe run --execute <game_dir>\<title_exe>
 ```
 
-> **Tuning notes (RTX 5060 Ti):** Keep `VICTORY_CARD_FETCH_INFLIGHT` off (`0`, default) — enabling it drops `copying back` (`~162 → ~45 ms`) but increases `on the GPU` (`~50–65 → ~200–330 ms`), lowering overall FPS. `VICTORY_BVH_BUILDER=1` reaches `50/53` compute shaders on wave32 (missing 3 `v_readfirstlane_b32` scans: `39321a95223001ed`, `77360df21e12ea43`, `9fc111d3be79364f`); `VICTORY_FIRSTLANE_OWN=1` reaches `53/53` and activates the builder, but corrupts BVH AABB offsets (~18 s crash), so leave it off for now.
+#### Preset for 8 GB VRAM GPUs (AMD RDNA2 / PCIe x4) + HDD
+The 16 GB preset above (`VICTORY_CARD_BUFFERS_MB = "2048"`, `VICTORY_TEXTURE_BUDGET_MB = "10240"`) exceeds 8 GB cards. On **8 GB VRAM GPUs** (such as the **Radeon RX 6500 XT**, especially over PCIe 3.0 x4 and with files on an HDD), lowering the budgets avoids paging, black skin textures, and display driver timeouts (`0x887A0006`):
+
+```powershell
+# Keep cache_dir and data_dir on an SSD in victory.toml (e.g. C:\victory-data)
+$env:VICTORY_RELAY = "0"
+$env:VICTORY_FILL_WAIT = "1"
+$env:VICTORY_CARD_BUFFERS_MB = "1024"
+$env:VICTORY_TEXTURE_BUDGET_MB = "5120"
+$env:VICTORY_PAGE_WRITES = "slots"
+$env:VICTORY_AMBIENT = "0.6"
+$env:VICTORY_TEXTURE_NO_WAIT = "1"
+$env:VICTORY_WIDE_REFRESH = "1"
+$env:VICTORY_WIDE_MERGE = "1"
+$env:VICTORY_JOIN_COPIES = "1"
+$env:VICTORY_DISPLAY_MODE = "1920x1080"
+
+.\target\release\victory.exe run --execute <game_dir>\<title_exe>
+```
+
+- **16 GB RAM + HDD tips:** Close browsers and heavy background apps before launching to leave RAM for Windows file caching, and set a manual **16 GB–24 GB** SSD pagefile to prevent Windows error `1455` during loading.
+
+> **Tuning notes (RTX 5060 Ti & 8 GB GPUs):** Enabling `VICTORY_TABLE_BUFFERS=1`, `VICTORY_INDIRECT_GATHER=1`, and `VICTORY_SYNC_NULL_SKIP` (default on) doubled open-world FPS on RTX 5060 Ti (`2.7 → 5.8 fps` at `3840x2160`, cutting `preparing` from `~230 ms` to `~105–113 ms`). `VICTORY_TEXTURE_BACK=1` restores shader-written water wave textures. The 2-line performance HUD (`VITORIABR | FPS | MS | DRAWS` + `RES | VRAM | GPU`) is controlled via `VICTORY_FPS_COUNTER` (`1`/`full` default, `compact`, or `0`). Use `VICTORY_CARD_BUFFERS_MB=2048` + `VICTORY_TEXTURE_BUDGET_MB=10240` on 16 GB GPUs (`1024` / `5120` on 8 GB GPUs) together with `VICTORY_PAGE_WRITES=slots` to prevent `the card has no room for new ones` and re-upload late-written placed textures (fixing black skin and ground). Keep `VICTORY_CARD_FETCH_INFLIGHT` off (`0`, default). To check session uptime, RAM and accumulated CPU:
+>
+> ```powershell
+> Get-Process victory_release* | Select-Object Id,ProcessName,StartTime,
+>   @{n='Horas';e={[math]::Round(((Get-Date)-$_.StartTime).TotalHours,2)}},
+>   @{n='RAM_GB';e={[math]::Round($_.WorkingSet64/1GB,2)}},CPU
+> ```
+>
+> Measured example (v19, Nov 25): **2 h 12 min**, **14.9 GB** RAM, **~10 h** CPU.
 
 Diagnostics build:
 ```powershell

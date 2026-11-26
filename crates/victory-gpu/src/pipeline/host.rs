@@ -91,7 +91,70 @@ impl Default for GraphicsState {
     }
 }
 
+/// Integer render target formats: D3D12 cannot blend into them.
+fn integer_format(f: DXGI_FORMAT) -> bool {
+    matches!(
+        f,
+        DXGI_FORMAT_R32G32B32A32_UINT
+            | DXGI_FORMAT_R32G32B32A32_SINT
+            | DXGI_FORMAT_R32G32B32_UINT
+            | DXGI_FORMAT_R32G32B32_SINT
+            | DXGI_FORMAT_R16G16B16A16_UINT
+            | DXGI_FORMAT_R16G16B16A16_SINT
+            | DXGI_FORMAT_R32G32_UINT
+            | DXGI_FORMAT_R32G32_SINT
+            | DXGI_FORMAT_R10G10B10A2_UINT
+            | DXGI_FORMAT_R8G8B8A8_UINT
+            | DXGI_FORMAT_R8G8B8A8_SINT
+            | DXGI_FORMAT_R16G16_UINT
+            | DXGI_FORMAT_R16G16_SINT
+            | DXGI_FORMAT_R32_UINT
+            | DXGI_FORMAT_R32_SINT
+            | DXGI_FORMAT_R8G8_UINT
+            | DXGI_FORMAT_R8G8_SINT
+            | DXGI_FORMAT_R16_UINT
+            | DXGI_FORMAT_R16_SINT
+            | DXGI_FORMAT_R8_UINT
+            | DXGI_FORMAT_R8_SINT
+    )
+}
+
+/// The title's blend state as the host takes it: blending off on integer
+/// render targets. The console ignores blending there, and titles leave it
+/// on (the world sets it on an `R8_UINT` target), but D3D12 does not allow
+/// it and refuses such a pipeline with `E_INVALIDARG`. With one description
+/// for every target, each target gets its own copy so the others keep theirs.
+fn host_blend(blend: &D3D12_BLEND_DESC, targets: &D3D12_RT_FORMAT_ARRAY) -> D3D12_BLEND_DESC {
+    let count = (targets.NumRenderTargets as usize).min(8);
+    let per_target = blend.IndependentBlendEnable.as_bool();
+    let blends = |i: usize| {
+        blend.RenderTarget[if per_target { i } else { 0 }]
+            .BlendEnable
+            .as_bool()
+    };
+    if !(0..count).any(|i| integer_format(targets.RTFormats[i]) && blends(i)) {
+        return *blend;
+    }
+    let mut host = *blend;
+    if !per_target {
+        host.IndependentBlendEnable = true.into();
+        host.RenderTarget = [blend.RenderTarget[0]; 8];
+    }
+    for i in 0..count {
+        if integer_format(targets.RTFormats[i]) {
+            host.RenderTarget[i].BlendEnable = false.into();
+        }
+    }
+    host
+}
+
 impl GraphicsState {
+    pub(super) fn writes_depth_only(&self) -> bool {
+        self.targets.NumRenderTargets == 0
+            && self.depth_format != DXGI_FORMAT_UNKNOWN
+            && self.depth.DepthEnable.as_bool()
+            && self.depth.DepthWriteMask == D3D12_DEPTH_WRITE_MASK_ALL
+    }
     /// Takes in one subobject of a stream: its type, then its data at +4
     /// (+8 for those holding pointers).
     ///
@@ -188,10 +251,13 @@ impl GraphicsState {
                 )
             })
             .collect();
-        let bounds = if self.depth_bounds {
-            " depth-bounds"
-        } else {
-            ""
+        let bounds = match (
+            self.depth_bounds,
+            !self.depth.DepthEnable.as_bool() && self.depth_format != DXGI_FORMAT_UNKNOWN,
+        ) {
+            (true, true) => " depth-bounds-ro",
+            (true, false) => " depth-bounds",
+            (false, _) => "",
         };
         format!(
             "{:?} {} {:?} {:?}{bounds} {inputs:?} {} {} {:?} {} {:?}",
@@ -209,10 +275,28 @@ impl GraphicsState {
 
     fn depth1(&self) -> D3D12_DEPTH_STENCIL_DESC1 {
         let d = &self.depth;
+        // WARP reports `DepthBoundsTestSupported = TRUE` yet skips the depth
+        // bounds check completely when `DepthEnable` is false. When a depth
+        // target format is present, `DepthEnable = TRUE` with `ALWAYS` and a
+        // zero write mask preserves `DepthEnable = FALSE` semantics (never
+        // rejects via `DepthFunc`, never writes depth, never triggers
+        // `StencilDepthFailOp`) while keeping `OMSetDepthBounds` active on
+        // both hardware GPUs and WARP.
+        let force_depth = self.depth_bounds
+            && !d.DepthEnable.as_bool()
+            && self.depth_format != DXGI_FORMAT_UNKNOWN;
         D3D12_DEPTH_STENCIL_DESC1 {
-            DepthEnable: d.DepthEnable,
-            DepthWriteMask: d.DepthWriteMask,
-            DepthFunc: d.DepthFunc,
+            DepthEnable: (d.DepthEnable.as_bool() || force_depth).into(),
+            DepthWriteMask: if force_depth {
+                D3D12_DEPTH_WRITE_MASK_ZERO
+            } else {
+                d.DepthWriteMask
+            },
+            DepthFunc: if force_depth {
+                D3D12_COMPARISON_FUNC_ALWAYS
+            } else {
+                d.DepthFunc
+            },
             StencilEnable: d.StencilEnable,
             StencilReadMask: d.StencilReadMask,
             StencilWriteMask: d.StencilWriteMask,
@@ -635,7 +719,7 @@ impl HostPipeline {
                     BytecodeLength: gs.len(),
                 }
             }),
-            BlendState: g.blend,
+            BlendState: host_blend(&g.blend, &g.targets),
             SampleMask: g.sample_mask,
             RasterizerState: g.rasterizer,
             DepthStencilState: g.depth,
@@ -882,7 +966,10 @@ fn mesh_pipeline(
             root: Sub(D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_ROOT_SIGNATURE, root.as_raw()),
             ms: Sub(D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_MS, ms),
             ps: Sub(D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_PS, ps),
-            blend: Sub(D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_BLEND, g.blend),
+            blend: Sub(
+                D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_BLEND,
+                host_blend(&g.blend, &g.targets),
+            ),
             mask: Sub(D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_SAMPLE_MASK, g.sample_mask),
             raster: Sub(D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_RASTERIZER, g.rasterizer),
             depth,
@@ -901,7 +988,10 @@ fn mesh_pipeline(
             root: Sub(D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_ROOT_SIGNATURE, root.as_raw()),
             ms: Sub(D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_MS, ms),
             ps: Sub(D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_PS, ps),
-            blend: Sub(D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_BLEND, g.blend),
+            blend: Sub(
+                D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_BLEND,
+                host_blend(&g.blend, &g.targets),
+            ),
             mask: Sub(D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_SAMPLE_MASK, g.sample_mask),
             raster: Sub(D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_RASTERIZER, g.rasterizer),
             depth: Sub(D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_DEPTH_STENCIL1, g.depth1()),
@@ -1096,27 +1186,38 @@ mod tests {
             21,
             D3D12_DEPTH_STENCIL_DESC1 {
                 DepthEnable: false.into(),
-                DepthWriteMask: D3D12_DEPTH_WRITE_MASK_ZERO,
-                DepthFunc: D3D12_COMPARISON_FUNC_ALWAYS,
+                // Ignored when `DepthEnable` is false: `depth1()` must clear
+                // writes and force `ALWAYS` when enabling depth for WARP.
+                DepthWriteMask: D3D12_DEPTH_WRITE_MASK_ALL,
+                DepthFunc: D3D12_COMPARISON_FUNC_NEVER,
                 DepthBoundsTestEnable: true.into(),
                 ..Default::default()
             },
         );
         // SAFETY: `sub` is a complete subobject 21.
         unsafe { g.read(21, (&raw const sub).cast()) };
+        // Without a depth target format (`DXGI_FORMAT_UNKNOWN`), `depth1()`
+        // keeps `DepthEnable = false` so D3D12 does not reject the PSO.
         assert!(g.depth_bounds);
+        assert!(!g.depth1().DepthEnable.as_bool());
         assert!(g.describe().contains("depth-bounds"));
+        assert!(!g.describe().contains("depth-bounds-ro"));
         g.rasterizer.CullMode = D3D12_CULL_MODE_NONE;
         g.targets.NumRenderTargets = 1;
         g.targets.RTFormats[0] = DXGI_FORMAT_R8G8B8A8_UNORM;
         g.depth_format = DXGI_FORMAT_D32_FLOAT;
+        let d1 = g.depth1();
+        assert!(d1.DepthEnable.as_bool());
+        assert_eq!(d1.DepthWriteMask, D3D12_DEPTH_WRITE_MASK_ZERO);
+        assert_eq!(d1.DepthFunc, D3D12_COMPARISON_FUNC_ALWAYS);
+        assert!(g.describe().contains("depth-bounds-ro"));
 
         let desc = D3D12_GRAPHICS_PIPELINE_STATE_DESC {
             // SAFETY: borrowed pointer, never released by the descriptor.
             pRootSignature: unsafe { std::mem::transmute_copy(&root) },
             VS: code(&vs),
             PS: code(&ps),
-            BlendState: g.blend,
+            BlendState: host_blend(&g.blend, &g.targets),
             SampleMask: g.sample_mask,
             RasterizerState: g.rasterizer,
             DepthStencilState: g.depth,
@@ -1314,11 +1415,361 @@ mod tests {
             }
         };
 
-        if host.is_software_adapter() {
-            eprintln!("software adapter (WARP) does not enforce OMSetDepthBounds when DepthEnable=false; skipping draw assertions");
-            return;
-        }
         assert_eq!(run_draw(0.6, 1.0), 0, "depth 0.5 outside [0.6, 1.0] must be rejected");
         assert_eq!(run_draw(0.4, 0.6), 255, "depth 0.5 inside [0.4, 0.6] must pass");
+
+        // Also exercise WARP directly on machines whose default `host()` is a
+        // hardware GPU, catching software-rasterizer regressions locally.
+        let _serial = crate::host::WARP_SERIAL
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        let Ok(warp) = crate::host::warp_adapter() else {
+            return;
+        };
+        let mut wdev: Option<ID3D12Device> = None;
+        // SAFETY: `warp` is a verified software DXGI adapter.
+        unsafe {
+            if D3D12CreateDevice(
+                &warp,
+                windows::Win32::Graphics::Direct3D::D3D_FEATURE_LEVEL_12_0,
+                &mut wdev,
+            )
+            .is_err()
+            {
+                return;
+            }
+        }
+        let Some(wdev) = wdev else { return };
+        let mut o2 = D3D12_FEATURE_DATA_D3D12_OPTIONS2::default();
+        // SAFETY: writes `o2` of the given size.
+        let ok = unsafe {
+            wdev.CheckFeatureSupport(
+                D3D12_FEATURE_D3D12_OPTIONS2,
+                (&raw mut o2).cast(),
+                size_of_val(&o2) as u32,
+            )
+            .is_ok()
+        };
+        if !ok || !o2.DepthBoundsTestSupported.as_bool() {
+            return;
+        }
+        // SAFETY: valid D3D12 descriptors and command recording on `wdev`.
+        unsafe {
+            use windows::core::Interface;
+            let (wroot, _) = root_signature(&wdev, &[], &[], false).unwrap();
+            #[repr(C)]
+            struct WarpStream {
+                root: Sub<*mut std::ffi::c_void>,
+                vs: Sub<D3D12_SHADER_BYTECODE>,
+                ps: Sub<D3D12_SHADER_BYTECODE>,
+                blend: Sub<D3D12_BLEND_DESC>,
+                mask: Sub<u32>,
+                raster: Sub<D3D12_RASTERIZER_DESC>,
+                depth: Sub<D3D12_DEPTH_STENCIL_DESC1>,
+                topology: Sub<D3D12_PRIMITIVE_TOPOLOGY_TYPE>,
+                targets: Sub<D3D12_RT_FORMAT_ARRAY>,
+                dsv: Sub<DXGI_FORMAT>,
+                samples: Sub<DXGI_SAMPLE_DESC>,
+            }
+            let mut stream = WarpStream {
+                root: Sub(
+                    D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_ROOT_SIGNATURE,
+                    wroot.as_raw(),
+                ),
+                vs: Sub(D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_VS, desc.VS),
+                ps: Sub(D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_PS, desc.PS),
+                blend: Sub(D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_BLEND, desc.BlendState),
+                mask: Sub(
+                    D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_SAMPLE_MASK,
+                    desc.SampleMask,
+                ),
+                raster: Sub(
+                    D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_RASTERIZER,
+                    desc.RasterizerState,
+                ),
+                depth: Sub(
+                    D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_DEPTH_STENCIL1,
+                    g.depth1(),
+                ),
+                topology: Sub(
+                    D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_PRIMITIVE_TOPOLOGY,
+                    desc.PrimitiveTopologyType,
+                ),
+                targets: Sub(
+                    D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_RENDER_TARGET_FORMATS,
+                    g.targets,
+                ),
+                dsv: Sub(
+                    D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_DEPTH_STENCIL_FORMAT,
+                    g.depth_format,
+                ),
+                samples: Sub(
+                    D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_SAMPLE_DESC,
+                    g.samples,
+                ),
+            };
+            let wpso: ID3D12PipelineState = wdev
+                .cast::<ID3D12Device2>()
+                .unwrap()
+                .CreatePipelineState(&D3D12_PIPELINE_STATE_STREAM_DESC {
+                    SizeInBytes: size_of::<WarpStream>(),
+                    pPipelineStateSubobjectStream: (&raw mut stream).cast(),
+                })
+                .unwrap();
+            let wq: ID3D12CommandQueue = wdev
+                .CreateCommandQueue(&D3D12_COMMAND_QUEUE_DESC {
+                    Type: D3D12_COMMAND_LIST_TYPE_DIRECT,
+                    ..Default::default()
+                })
+                .unwrap();
+            let wf: ID3D12Fence = wdev.CreateFence(0, D3D12_FENCE_FLAG_NONE).unwrap();
+            let wev =
+                windows::Win32::System::Threading::CreateEventW(None, false, false, None).unwrap();
+            let wrtv_heap: ID3D12DescriptorHeap = wdev
+                .CreateDescriptorHeap(&D3D12_DESCRIPTOR_HEAP_DESC {
+                    Type: D3D12_DESCRIPTOR_HEAP_TYPE_RTV,
+                    NumDescriptors: 1,
+                    ..Default::default()
+                })
+                .unwrap();
+            let wdsv_heap: ID3D12DescriptorHeap = wdev
+                .CreateDescriptorHeap(&D3D12_DESCRIPTOR_HEAP_DESC {
+                    Type: D3D12_DESCRIPTOR_HEAP_TYPE_DSV,
+                    NumDescriptors: 1,
+                    ..Default::default()
+                })
+                .unwrap();
+            let wmake_tex = |format, flags, state, clear: D3D12_CLEAR_VALUE| {
+                let heap = D3D12_HEAP_PROPERTIES {
+                    Type: D3D12_HEAP_TYPE_DEFAULT,
+                    ..Default::default()
+                };
+                let rd = D3D12_RESOURCE_DESC {
+                    Dimension: D3D12_RESOURCE_DIMENSION_TEXTURE2D,
+                    Width: 4,
+                    Height: 4,
+                    DepthOrArraySize: 1,
+                    MipLevels: 1,
+                    Format: format,
+                    SampleDesc: DXGI_SAMPLE_DESC {
+                        Count: 1,
+                        Quality: 0,
+                    },
+                    Flags: flags,
+                    ..Default::default()
+                };
+                let mut out: Option<ID3D12Resource> = None;
+                wdev.CreateCommittedResource(
+                    &heap,
+                    D3D12_HEAP_FLAG_NONE,
+                    &rd,
+                    state,
+                    Some(&clear),
+                    &mut out,
+                )
+                .unwrap();
+                out.unwrap()
+            };
+            let wcolor = wmake_tex(
+                DXGI_FORMAT_R8G8B8A8_UNORM,
+                D3D12_RESOURCE_FLAG_ALLOW_RENDER_TARGET,
+                D3D12_RESOURCE_STATE_RENDER_TARGET,
+                D3D12_CLEAR_VALUE {
+                    Format: DXGI_FORMAT_R8G8B8A8_UNORM,
+                    Anonymous: D3D12_CLEAR_VALUE_0 { Color: [0.0; 4] },
+                },
+            );
+            let wdepth = wmake_tex(
+                DXGI_FORMAT_D32_FLOAT,
+                D3D12_RESOURCE_FLAG_ALLOW_DEPTH_STENCIL,
+                D3D12_RESOURCE_STATE_DEPTH_WRITE,
+                D3D12_CLEAR_VALUE {
+                    Format: DXGI_FORMAT_D32_FLOAT,
+                    Anonymous: D3D12_CLEAR_VALUE_0 {
+                        DepthStencil: D3D12_DEPTH_STENCIL_VALUE {
+                            Depth: 0.5,
+                            Stencil: 0,
+                        },
+                    },
+                },
+            );
+            let wreadback = {
+                let heap = D3D12_HEAP_PROPERTIES {
+                    Type: D3D12_HEAP_TYPE_READBACK,
+                    ..Default::default()
+                };
+                let rd = D3D12_RESOURCE_DESC {
+                    Dimension: D3D12_RESOURCE_DIMENSION_BUFFER,
+                    Width: 1024,
+                    Height: 1,
+                    DepthOrArraySize: 1,
+                    MipLevels: 1,
+                    SampleDesc: DXGI_SAMPLE_DESC {
+                        Count: 1,
+                        Quality: 0,
+                    },
+                    Layout: D3D12_TEXTURE_LAYOUT_ROW_MAJOR,
+                    ..Default::default()
+                };
+                let mut out: Option<ID3D12Resource> = None;
+                wdev.CreateCommittedResource(
+                    &heap,
+                    D3D12_HEAP_FLAG_NONE,
+                    &rd,
+                    D3D12_RESOURCE_STATE_COPY_DEST,
+                    None,
+                    &mut out,
+                )
+                .unwrap();
+                out.unwrap()
+            };
+            let wrtv = wrtv_heap.GetCPUDescriptorHandleForHeapStart();
+            let wdsv = wdsv_heap.GetCPUDescriptorHandleForHeapStart();
+            wdev.CreateRenderTargetView(&wcolor, None, wrtv);
+            wdev.CreateDepthStencilView(&wdepth, None, wdsv);
+            let mut fence_val = 0u64;
+            let mut warp_draw = |min: f32, max: f32| -> u8 {
+                let walloc: ID3D12CommandAllocator = wdev
+                    .CreateCommandAllocator(D3D12_COMMAND_LIST_TYPE_DIRECT)
+                    .unwrap();
+                let wlist: ID3D12GraphicsCommandList = wdev
+                    .CreateCommandList(0, D3D12_COMMAND_LIST_TYPE_DIRECT, &walloc, None)
+                    .unwrap();
+                wlist
+                    .cast::<ID3D12GraphicsCommandList1>()
+                    .unwrap()
+                    .OMSetDepthBounds(min, max);
+                wlist.ClearRenderTargetView(wrtv, &[0.0; 4], None);
+                wlist.ClearDepthStencilView(wdsv, D3D12_CLEAR_FLAG_DEPTH, 0.5, 0, None);
+                wlist.OMSetRenderTargets(1, Some(&wrtv), false, Some(&wdsv));
+                wlist.RSSetViewports(&[D3D12_VIEWPORT {
+                    TopLeftX: 0.0,
+                    TopLeftY: 0.0,
+                    Width: 4.0,
+                    Height: 4.0,
+                    MinDepth: 0.0,
+                    MaxDepth: 1.0,
+                }]);
+                wlist.RSSetScissorRects(&[windows::Win32::Foundation::RECT {
+                    left: 0,
+                    top: 0,
+                    right: 4,
+                    bottom: 4,
+                }]);
+                wlist.SetGraphicsRootSignature(&wroot);
+                wlist.SetPipelineState(&wpso);
+                wlist.IASetPrimitiveTopology(
+                    windows::Win32::Graphics::Direct3D::D3D_PRIMITIVE_TOPOLOGY_TRIANGLELIST,
+                );
+                wlist.DrawInstanced(3, 1, 0, 0);
+                wlist.ResourceBarrier(&[crate::host::transition(
+                    &wcolor,
+                    D3D12_RESOURCE_STATE_RENDER_TARGET,
+                    D3D12_RESOURCE_STATE_COPY_SOURCE,
+                )]);
+                let dst = D3D12_TEXTURE_COPY_LOCATION {
+                    pResource: std::mem::transmute_copy(&wreadback),
+                    Type: D3D12_TEXTURE_COPY_TYPE_PLACED_FOOTPRINT,
+                    Anonymous: D3D12_TEXTURE_COPY_LOCATION_0 {
+                        PlacedFootprint: D3D12_PLACED_SUBRESOURCE_FOOTPRINT {
+                            Offset: 0,
+                            Footprint: D3D12_SUBRESOURCE_FOOTPRINT {
+                                Format: DXGI_FORMAT_R8G8B8A8_UNORM,
+                                Width: 4,
+                                Height: 4,
+                                Depth: 1,
+                                RowPitch: 256,
+                            },
+                        },
+                    },
+                };
+                let src = D3D12_TEXTURE_COPY_LOCATION {
+                    pResource: std::mem::transmute_copy(&wcolor),
+                    Type: D3D12_TEXTURE_COPY_TYPE_SUBRESOURCE_INDEX,
+                    Anonymous: D3D12_TEXTURE_COPY_LOCATION_0 {
+                        SubresourceIndex: 0,
+                    },
+                };
+                wlist.CopyTextureRegion(&dst, 0, 0, 0, &src, None);
+                wlist.ResourceBarrier(&[crate::host::transition(
+                    &wcolor,
+                    D3D12_RESOURCE_STATE_COPY_SOURCE,
+                    D3D12_RESOURCE_STATE_RENDER_TARGET,
+                )]);
+                wlist.Close().unwrap();
+                wq.ExecuteCommandLists(&[Some(wlist.cast().unwrap())]);
+                fence_val += 1;
+                wq.Signal(&wf, fence_val).unwrap();
+                wf.SetEventOnCompletion(fence_val, wev).unwrap();
+                windows::Win32::System::Threading::WaitForSingleObject(wev, u32::MAX);
+                let mut ptr = std::ptr::null_mut();
+                wreadback.Map(0, None, Some(&mut ptr)).unwrap();
+                let px = *ptr.cast::<u8>();
+                wreadback.Unmap(0, None);
+                px
+            };
+            assert_eq!(
+                warp_draw(0.6, 1.0),
+                0,
+                "WARP: depth 0.5 outside [0.6, 1.0] must be rejected"
+            );
+            assert_eq!(
+                warp_draw(0.4, 0.6),
+                255,
+                "WARP: depth 0.5 inside [0.4, 0.6] must pass"
+            );
+        }
+    }
+
+    fn blend_targets(formats: &[DXGI_FORMAT]) -> D3D12_RT_FORMAT_ARRAY {
+        let mut t = D3D12_RT_FORMAT_ARRAY {
+            NumRenderTargets: formats.len() as u32,
+            ..Default::default()
+        };
+        t.RTFormats[..formats.len()].copy_from_slice(formats);
+        t
+    }
+
+    fn blending(independent: bool) -> D3D12_BLEND_DESC {
+        let mut b = GraphicsState::default().blend;
+        b.IndependentBlendEnable = independent.into();
+        for t in &mut b.RenderTarget {
+            t.BlendEnable = true.into();
+            t.SrcBlend = D3D12_BLEND_SRC_ALPHA;
+            t.DestBlend = D3D12_BLEND_INV_SRC_ALPHA;
+        }
+        b
+    }
+
+    #[test]
+    fn integer_targets_do_not_blend() {
+        let t = blend_targets(&[
+            DXGI_FORMAT_R8G8B8A8_UNORM,
+            DXGI_FORMAT_R16G16B16A16_FLOAT,
+            DXGI_FORMAT_R8_UINT,
+        ]);
+        for independent in [false, true] {
+            let host = host_blend(&blending(independent), &t);
+            assert!(host.IndependentBlendEnable.as_bool());
+            assert!(host.RenderTarget[0].BlendEnable.as_bool());
+            assert!(host.RenderTarget[1].BlendEnable.as_bool());
+            assert!(!host.RenderTarget[2].BlendEnable.as_bool());
+            assert_eq!(host.RenderTarget[2].SrcBlend, D3D12_BLEND_SRC_ALPHA);
+            assert_eq!(host.RenderTarget[0].DestBlend, D3D12_BLEND_INV_SRC_ALPHA);
+        }
+    }
+
+    #[test]
+    fn blend_states_without_integer_blending_are_kept() {
+        let b = blending(false);
+        let t = blend_targets(&[DXGI_FORMAT_R8G8B8A8_UNORM, DXGI_FORMAT_R11G11B10_FLOAT]);
+        assert_eq!(host_blend(&b, &t), b);
+        let mut b = blending(true);
+        b.RenderTarget[1].BlendEnable = false.into();
+        let t = blend_targets(&[DXGI_FORMAT_R8G8B8A8_UNORM, DXGI_FORMAT_R32_UINT]);
+        assert_eq!(host_blend(&b, &t), b);
+        let mut t = blend_targets(&[DXGI_FORMAT_R8G8B8A8_UNORM]);
+        t.RTFormats[1] = DXGI_FORMAT_R8_UINT;
+        assert_eq!(host_blend(&blending(false), &t), blending(false));
     }
 }

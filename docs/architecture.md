@@ -41,7 +41,7 @@ looks up (docs/precompilacao-shaders.md).
 | `victory-pipeline` | converter trait, content-addressed cache |
 | `victory-game` | the title-specific formats, build identities, hooks |
 | `apps/victory` | command-line front end |
-| `xtask` | asset-policy check, git hooks |
+| `xtask` | asset-policy check, git hooks, `cargo xtask ci` (the CI steps, locally) |
 | `tests/fixtures/hle-probe` | a stand-in "title" (our own code) for loader tests |
 
 Everything except `victory-game` is platform-level and can be tested with

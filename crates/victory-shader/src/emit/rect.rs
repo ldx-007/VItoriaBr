@@ -414,6 +414,8 @@ mod tests {
             root_cbvs: Vec::new(),
             root_srvs: Vec::new(),
             root_uavs: Vec::new(),
+            written_root_uavs: Vec::new(),
+            writes_guest_memory: false,
             root_indexed_views: Vec::new(),
         };
         (
@@ -432,7 +434,7 @@ mod tests {
     fn rectangles_are_drawn_whole() {
         use super::super::host::{Draw, Host};
         let Ok(host) = Host::new(false) else {
-            eprintln!("no SM 6.6 device; skipped");
+            crate::emit::test_skip::skip("no SM 6.6 device; skipped");
             return;
         };
         let (vs, ps) = pass_through();
